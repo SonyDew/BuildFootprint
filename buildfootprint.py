@@ -64,6 +64,7 @@ def scan(root: Path, top: int) -> dict[str, Any]:
 
     files: dict[str, int] = {}
     dirs = 0
+    entries_seen = 0
     skipped_links = 0
     skipped_other = 0
     pending = [(root, "")]
@@ -76,24 +77,27 @@ def scan(root: Path, top: int) -> dict[str, Any]:
             # Recheck before opening; concurrent modifications remain unsupported.
             if not stat.S_ISDIR(folder.lstat().st_mode):
                 raise ScanError("directory changed during scan")
+            # Stream entries: sorting a directory first can allocate unbounded memory.
             with os.scandir(folder) as iterator:
-                entries = sorted(iterator, key=lambda entry: entry.name)
-            for entry in entries:
-                rel = prefix + entry.name
-                metadata = entry.stat(follow_symlinks=False)
-                mode = metadata.st_mode
-                if stat.S_ISLNK(mode):
-                    skipped_links += 1
-                elif stat.S_ISDIR(mode):
-                    pending.append((Path(entry.path), rel + "/"))
-                elif stat.S_ISREG(mode):
-                    if metadata.st_size < 0:
-                        raise ScanError("invalid file size")
-                    files[rel] = metadata.st_size
-                    if len(files) > MAX_ENTRIES:
-                        raise ScanError("file limit exceeded (200000)")
-                else:
-                    skipped_other += 1
+                for entry in iterator:
+                    entries_seen += 1
+                    rel = prefix + entry.name
+                    metadata = entry.stat(follow_symlinks=False)
+                    mode = metadata.st_mode
+                    if stat.S_ISLNK(mode):
+                        skipped_links += 1
+                    elif stat.S_ISDIR(mode):
+                        pending.append((Path(entry.path), rel + "/"))
+                    elif stat.S_ISREG(mode):
+                        if metadata.st_size < 0:
+                            raise ScanError("invalid file size")
+                        files[rel] = metadata.st_size
+                        if len(files) > MAX_ENTRIES:
+                            raise ScanError("file limit exceeded (200000)")
+                    else:
+                        skipped_other += 1
+                    if entries_seen > MAX_ENTRIES:
+                        raise ScanError("entry limit exceeded (200000)")
         except ScanError:
             raise
         except (OSError, ValueError):

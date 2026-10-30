@@ -213,5 +213,101 @@ class BuildFootprintTests(unittest.TestCase):
             bf.scan(self.new, 10)
 
 
+    def test_limit_skipped_symlinks(self):
+        target = self.write("target.js", b"secret")
+        try:
+            for i in range(3):
+                (self.new / f"link-{i}").symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        old = bf.MAX_ENTRIES
+        bf.MAX_ENTRIES = 3
+        self.addCleanup(setattr, bf, "MAX_ENTRIES", old)
+        with self.assertRaisesRegex(bf.ScanError, "entry limit"):
+            bf.scan(self.new, 10)
+        self.assertEqual(target.read_bytes(), b"secret")
+
+    def test_limit_skipped_special_files(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO unavailable")
+        for i in range(3):
+            os.mkfifo(self.new / f"pipe-{i}")
+        old = bf.MAX_ENTRIES
+        bf.MAX_ENTRIES = 2
+        self.addCleanup(setattr, bf, "MAX_ENTRIES", old)
+        with self.assertRaisesRegex(bf.ScanError, "entry limit"):
+            bf.scan(self.new, 10)
+
+    def test_entry_limit_across_nested_directories(self):
+        self.write("sub/a.js")
+        self.write("sub/b.js")
+        old = bf.MAX_ENTRIES
+        bf.MAX_ENTRIES = 2
+        self.addCleanup(setattr, bf, "MAX_ENTRIES", old)
+        with self.assertRaisesRegex(bf.ScanError, "entry limit"):
+            bf.scan(self.new, 10)
+
+    def test_sorted_reports_do_not_depend_on_creation_order(self):
+        self.write("z.js", b"a" * 4)
+        self.write("a.js", b"a" * 4)
+        self.write("b.css", b"a" * 4)
+        report = bf.scan(self.new, 10)
+        self.assertEqual([x["path"] for x in report["largest_files"]],
+                         ["a.js", "b.css", "z.js"])
+        self.assertEqual([x["extension"] for x in report["by_extension"]],
+                         [".js", ".css"])
+
+    def test_comparison_budget_checks_current_only(self):
+        previous = self.root / "previous"
+        previous.mkdir()
+        self.write("huge.js", b"x" * 100, previous)
+        self.write("tiny.js", b"x")
+        code, output, error = self.cli("--compare", previous, "--max-total", "2B", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["comparison"]["delta_bytes"], -99)
+
+    def test_missing_comparison_returns_error_without_report(self):
+        code, output, error = self.cli("--compare", self.root / "missing", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertNotIn(str(self.root), error)
+
+    def test_sparse_file_uses_metadata_not_contents(self):
+        path = self.new / "large.js"
+        with path.open("wb") as file:
+            file.truncate(2 * 1024**3)
+        result = bf.scan(self.new, 10)
+        self.assertEqual(result["total_bytes"], 2 * 1024**3)
+        self.assertEqual(path.stat().st_size, 2 * 1024**3)
+
+    def test_cli_invalid_arguments_exit_2(self):
+        import subprocess
+        import sys
+        for option in (("--top", "0"), ("--max-total", "1.5B"),
+                       ("--max-file", "1TB")):
+            with self.subTest(option=option):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "buildfootprint", str(self.new), *option],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("error:", proc.stderr)
+
+    def test_filename_newline_is_escaped(self):
+        self.write("name\nsecret.js", b"x")
+        code, output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertNotIn("name\nsecret", output)
+        self.assertIn(r"name\nsecret", output)
+
+    def test_json_is_deterministic(self):
+        self.write("z.js", b"a" * 3)
+        self.write("a.js", b"a" * 3)
+        first = self.cli("--json")
+        second = self.cli("--json")
+        self.assertEqual(first, second)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -44,7 +44,7 @@ The CLI returns exit code `0` for a successful scan within budget, `1` when a si
 - Counts logical file lengths (`st_size`), not allocated disk space or compressed transfer size. It does not calculate gzip or Brotli sizes.
 - Includes hidden files. Skips symbolic links, sockets, and other non-regular entries; reports their counts. Hard-linked paths are counted separately.
 - Compares paths and sizes only. Files with the same path and length are treated as unchanged even if their contents differ.
-- Scans at most 200,000 files and 200,000 directories per build. Does not write to build directories.
+- Scans at most 200,000 directory entries in total per build, including skipped links and special files. The file and directory limits are also 200,000 each. Entries are processed incrementally rather than sorting each directory in memory. The scanner does not write to build directories.
 - Does not guarantee consistent results if files are modified while scanning. It does not follow symlinks encountered during normal traversal, but it is not designed to defend against an adversary changing directory entries concurrently.
 - Paths in reports are relative to the scanned directory. Text output escapes control characters in file names.
 
@@ -54,6 +54,6 @@ The CLI returns exit code `0` for a successful scan within budget, `1` when a si
 python -m unittest discover -s tests -v
 ```
 
-Development check (2026-10-30): 26 unit and CLI tests passed on Python 3.13.5 (Linux). A wheel was built and installed in a clean virtual environment; the installed CLI ran against sample build directories. Other Python versions and Windows have not been tested.
+Development check (2026-10-30, afternoon): 36 unit and CLI tests passed on Python 3.13.5 (Linux). Tests cover size budgets, comparison, invalid arguments, skipped symlinks and FIFOs, entry limits, output escaping, and read-only scanning of a sparse file. A wheel was built and the installed CLI was exercised on sample build directories. Other Python versions and Windows have not been tested.
 
 MIT licensed. See [LICENSE](LICENSE).
