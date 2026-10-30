@@ -1,0 +1,217 @@
+import contextlib
+from io import StringIO
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+
+import buildfootprint as bf
+
+
+class BuildFootprintTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.new = self.root / "new"
+        self.new.mkdir()
+
+    def write(self, relative, content=b"a", folder=None):
+        path = (folder or self.new) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def cli(self, *args):
+        stdout, stderr = StringIO(), StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = bf.main([str(self.new), *map(str, args)])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_empty_directory(self):
+        result = bf.scan(self.new, 10)
+        self.assertEqual((result["total_bytes"], result["file_count"], result["directory_count"]), (0, 0, 1))
+        self.assertEqual(result["by_extension"], [])
+
+    def test_regular_files_and_nested_directories(self):
+        self.write("a.js", b"a" * 5)
+        self.write("nested/b.CSS", b"a" * 3)
+        result = bf.scan(self.new, 10)
+        self.assertEqual(result["total_bytes"], 8)
+        self.assertEqual(result["directory_count"], 2)
+        self.assertEqual(result["by_extension"][0]["extension"], ".js")
+        self.assertEqual(result["by_extension"][1]["extension"], ".css")
+
+    def test_hidden_and_extensionless(self):
+        self.write(".hidden", b"a")
+        self.write("LICENSE", b"abc")
+        result = bf.scan(self.new, 10)
+        self.assertEqual(result["by_extension"], [{"extension": "[none]", "files": 2, "bytes": 4}])
+
+    def test_largest_sort_tie(self):
+        self.write("z.js", b"a" * 5)
+        self.write("a.js", b"a" * 5)
+        result = bf.scan(self.new, 1)
+        self.assertEqual(result["largest_files"], [{"path": "a.js", "bytes": 5}])
+
+    def test_skip_symlink_file(self):
+        outside = self.root / "outside"
+        outside.write_bytes(b"secret" * 100)
+        try:
+            (self.new / "link.js").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        result = bf.scan(self.new, 10)
+        self.assertEqual(result["file_count"], 0)
+        self.assertEqual(result["symlinks_skipped"], 1)
+
+    def test_skip_symlink_directory(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "secret.js").write_bytes(b"secret")
+        try:
+            (self.new / "linked").symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        result = bf.scan(self.new, 10)
+        self.assertEqual(result["file_count"], 0)
+        self.assertEqual(result["symlinks_skipped"], 1)
+
+    def test_reject_symlink_root(self):
+        link = self.root / "link"
+        try:
+            link.symlink_to(self.new, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        with self.assertRaisesRegex(bf.ScanError, "not a symlink"):
+            bf.scan(link, 10)
+
+    def test_reject_file_root(self):
+        path = self.write("index.html")
+        with self.assertRaises(bf.ScanError):
+            bf.scan(path, 10)
+
+    def test_reject_missing_root(self):
+        with self.assertRaisesRegex(bf.ScanError, "cannot access"):
+            bf.scan(self.root / "missing", 10)
+
+    def test_other_special_entry(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO unavailable")
+        os.mkfifo(self.new / "pipe")
+        result = bf.scan(self.new, 10)
+        self.assertEqual(result["other_skipped"], 1)
+
+    def test_compare_add_remove_resize(self):
+        a = {"a.js": 3, "b.js": 2, "same.css": 4}
+        b = {"a.js": 8, "new.js": 10, "same.css": 4}
+        result = bf.compare(a, b)
+        self.assertEqual(result, {"added_files": 1, "removed_files": 1,
+                                  "resized_files": 1, "unchanged_size_files": 1,
+                                  "delta_bytes": 13, "added_bytes": 10, "removed_bytes": 2})
+
+    def test_compare_same_size_is_unchanged(self):
+        self.assertEqual(bf.compare({"a.js": 3}, {"a.js": 3})["unchanged_size_files"], 1)
+
+    def test_parse_sizes(self):
+        self.assertEqual(bf.parse_size("1.5KiB"), 1536)
+        self.assertEqual(bf.parse_size("2MB"), 2_000_000)
+        self.assertEqual(bf.parse_size("0"), 0)
+        self.assertEqual(bf.parse_size("1gib"), 1024**3)
+
+    def test_invalid_sizes(self):
+        for value in ("-1", "1.3B", "1.001MiB", "1e10", "1TB", "nan", "1GiBextra", "99999999999999999999999"):
+            with self.subTest(value=value), self.assertRaises(Exception):
+                bf.parse_size(value)
+
+    def test_invalid_top(self):
+        for value in ("0", "101", "foo", "1.5"):
+            with self.subTest(value=value), self.assertRaises(Exception):
+                bf.parse_top(value)
+
+    def test_json_output(self):
+        self.write("app.js", b"123")
+        code, output, error = self.cli("--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(error, "")
+        result = json.loads(output)
+        self.assertEqual(result["total_bytes"], 3)
+        self.assertEqual(result["largest_files"][0]["path"], "app.js")
+        self.assertNotIn("_files", result)
+
+    def test_text_output(self):
+        self.write("app.js", b"123")
+        code, output, error = self.cli()
+        self.assertEqual(code, 0)
+        self.assertIn("Total: 3 B", output)
+        self.assertEqual(error, "")
+
+    def test_total_budget_exceeded(self):
+        self.write("app.js", b"123")
+        code, output, _ = self.cli("--max-total", "2B", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(output)["budget_failures"], ["total"])
+
+    def test_file_budget_exceeded(self):
+        self.write("app.js", b"123")
+        code, output, _ = self.cli("--max-file", "2")
+        self.assertEqual(code, 1)
+        self.assertIn("file", output)
+
+    def test_equal_budget_passes(self):
+        self.write("app.js", b"123")
+        self.assertEqual(self.cli("--max-total", "3B", "--max-file", "3B")[0], 0)
+
+    def test_compare_cli(self):
+        previous = self.root / "previous"
+        previous.mkdir()
+        self.write("old.js", b"123", previous)
+        self.write("new.js", b"12345")
+        code, output, _ = self.cli("--compare", previous, "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["comparison"]["delta_bytes"], 2)
+
+    def test_invalid_directory_exit_2(self):
+        self.new.rmdir()
+        code, output, error = self.cli("--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertIn("cannot access", error)
+
+    def test_content_not_read_or_emitted(self):
+        secret = b"very-private-value"
+        path = self.write("app.js", secret)
+        original = path.read_bytes()
+        code, output, error = self.cli()
+        self.assertEqual(code, 0)
+        self.assertNotIn(secret.decode(), output + error)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_control_characters_escaped(self):
+        self.write("\x1b[31m.js", b"abc")
+        code, output, _ = self.cli()
+        self.assertEqual(code, 0)
+        self.assertNotIn("\x1b", output)
+        self.assertIn("\\u001b", output)
+
+    def test_limit_files(self):
+        old = bf.MAX_ENTRIES
+        bf.MAX_ENTRIES = 1
+        self.addCleanup(setattr, bf, "MAX_ENTRIES", old)
+        self.write("one.js")
+        self.write("two.js")
+        with self.assertRaisesRegex(bf.ScanError, "file limit"):
+            bf.scan(self.new, 10)
+
+    def test_limit_directories(self):
+        old = bf.MAX_ENTRIES
+        bf.MAX_ENTRIES = 1
+        self.addCleanup(setattr, bf, "MAX_ENTRIES", old)
+        (self.new / "nested").mkdir()
+        with self.assertRaisesRegex(bf.ScanError, "directory limit"):
+            bf.scan(self.new, 10)
+
+
+if __name__ == "__main__":
+    unittest.main()
