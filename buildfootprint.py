@@ -57,7 +57,7 @@ def scan(root: Path, top: int) -> dict[str, Any]:
     """Collect metadata for regular files, without following known symlinks."""
     try:
         root_stat = root.lstat()
-    except OSError:
+    except (OSError, ValueError):
         raise ScanError("cannot access build directory") from None
     if not stat.S_ISDIR(root_stat.st_mode):
         raise ScanError("build path must be a directory, not a symlink or file")
