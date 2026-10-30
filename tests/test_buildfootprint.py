@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import buildfootprint as bf
 
@@ -308,6 +309,76 @@ class BuildFootprintTests(unittest.TestCase):
         second = self.cli("--json")
         self.assertEqual(first, second)
 
+
+    def test_nul_in_root_path_is_a_sanitized_error(self):
+        secret = "hidden-token"
+        with contextlib.redirect_stdout(StringIO()) as output, contextlib.redirect_stderr(StringIO()) as error:
+            code = bf.main([secret + "\0suffix", "--json"])
+        self.assertEqual(code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("cannot access build directory", error.getvalue())
+        self.assertNotIn(secret, error.getvalue())
+
+    def test_nul_in_previous_path_is_a_sanitized_error(self):
+        code, output, error = self.cli("--compare", "private\0value", "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertNotIn("private", error)
+
+    def test_os_error_does_not_disclose_directory_name(self):
+        secret = "sensitive-folder"
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError(secret)):
+            code, output, error = self.cli("--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertNotIn(secret, error)
+
+    def test_scandir_error_does_not_disclose_path(self):
+        with mock.patch.object(bf.os, "scandir", side_effect=PermissionError("secret-path")):
+            code, output, error = self.cli("--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertNotIn("secret-path", error)
+
+    def test_zero_byte_budget(self):
+        self.write("empty.js", b"")
+        self.assertEqual(self.cli("--max-total", "0", "--max-file", "0")[0], 0)
+        self.write("nonempty.css", b"x")
+        code, output, error = self.cli("--max-total", "0", "--max-file", "0", "--json")
+        self.assertEqual((code, error), (1, ""))
+        self.assertEqual(json.loads(output)["budget_failures"], ["total", "file"])
+
+    def test_scan_does_not_open_file_contents(self):
+        self.write("secret.txt", b"hidden-data")
+        with mock.patch("builtins.open", side_effect=AssertionError("content opened")):
+            result = bf.scan(self.new, 10)
+        self.assertEqual(result["total_bytes"], 11)
+
+    def test_comparison_symlink_root_rejected(self):
+        link = self.root / "previous-link"
+        try:
+            link.symlink_to(self.new, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        code, output, error = self.cli("--compare", link, "--json")
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertIn("not a symlink", error)
+
+    def test_json_escapes_terminal_control_in_path(self):
+        self.write("private\x1b[31m.js", b"x")
+        code, output, error = self.cli("--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertNotIn("\x1b", output)
+        self.assertEqual(json.loads(output)["largest_files"][0]["path"], "private\x1b[31m.js")
+
+    def test_size_unit_boundaries(self):
+        self.assertEqual(bf.parse_size("0.01KB"), 10)
+        self.assertEqual(bf.parse_size("9223372036854775807B"), 2**63 - 1)
+        with self.assertRaises(Exception):
+            bf.parse_size("9223372036854775808B")
+        with self.assertRaises(Exception):
+            bf.parse_size("0.01KiB")
 
 if __name__ == "__main__":
     unittest.main()
